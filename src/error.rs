@@ -60,6 +60,10 @@ pub enum Error {
    #[error("no active transaction for database: {0}")]
    NoActiveTransaction(String),
 
+   /// Command pipeline not found in registry.
+   #[error("command pipeline not found: {0}")]
+   PipelineNotFound(String),
+
    /// Invalid transaction token provided.
    #[error("invalid transaction token")]
    InvalidTransactionToken,
@@ -92,6 +96,7 @@ impl Error {
          Error::TransactionRollbackFailed { .. } => "TRANSACTION_ROLLBACK_FAILED".to_string(),
          Error::TransactionAlreadyActive(_) => "TRANSACTION_ALREADY_ACTIVE".to_string(),
          Error::NoActiveTransaction(_) => "NO_ACTIVE_TRANSACTION".to_string(),
+         Error::PipelineNotFound(_) => "PIPELINE_NOT_FOUND".to_string(),
          Error::InvalidTransactionToken => "INVALID_TRANSACTION_TOKEN".to_string(),
          Error::Other(_) => "ERROR".to_string(),
       }

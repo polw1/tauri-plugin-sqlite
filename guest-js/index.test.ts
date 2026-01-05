@@ -15,6 +15,8 @@ beforeEach(() => {
       if (cmd === 'plugin:sqlite|load') return (args as { db: string }).db
       if (cmd === 'plugin:sqlite|execute') return [1, 1]
       if (cmd === 'plugin:sqlite|execute_transaction') return []
+      if (cmd === 'plugin:sqlite|register_pipeline') return undefined
+      if (cmd === 'plugin:sqlite|execute_pipeline_transaction') return []
       if (cmd === 'plugin:sqlite|execute_interruptible_transaction') {
          return { dbPath: (args as { db: string }).db, transactionId: 'test-tx-id' }
       }
@@ -55,6 +57,23 @@ describe('Database commands', () => {
       await Database.get('t.db').executeTransaction([['DELETE FROM t']])
       expect(lastCmd).toBe('plugin:sqlite|execute_transaction')
       expect(lastArgs.statements).toEqual([{ query: 'DELETE FROM t', values: [] }])
+   })
+
+   it('registerPipeline', async () => {
+      await Database.get('t.db').registerPipeline('daily-cleanup', [
+         ['DELETE FROM logs WHERE created_at < $1', ['2024-01-01']],
+      ])
+      expect(lastCmd).toBe('plugin:sqlite|register_pipeline')
+      expect(lastArgs).toMatchObject({
+         pipelineId: 'daily-cleanup',
+         statements: [{ query: 'DELETE FROM logs WHERE created_at < $1', values: ['2024-01-01'] }],
+      })
+   })
+
+   it('executePipelineTransaction', async () => {
+      await Database.get('t.db').executePipelineTransaction('daily-cleanup')
+      expect(lastCmd).toBe('plugin:sqlite|execute_pipeline_transaction')
+      expect(lastArgs).toMatchObject({ db: 't.db', pipelineId: 'daily-cleanup' })
    })
 
    it('fetch_all', async () => {

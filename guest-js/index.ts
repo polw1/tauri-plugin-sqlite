@@ -265,6 +265,71 @@ export default class Database {
    }
 
    /**
+    * **registerPipeline**
+    *
+    * Register a batch of statements under an identifier for later execution.
+    * Statements are stored on the backend and can be executed multiple times
+    * without resending the SQL and bindings.
+    *
+    * Use with `executePipelineTransaction()` to run registered statements atomically.
+    *
+    * @param pipelineId - Unique identifier for the pipeline
+    * @param statements - Array of [query, values?] tuples
+    *
+    * @example
+    * ```ts
+    * // Register once at startup
+    * await db.registerPipeline('log-events', [
+    *    ['INSERT INTO logs (level, message) VALUES ($1, $2)', ['INFO', 'App started']],
+    *    ['INSERT INTO logs (level, message) VALUES ($1, $2)', ['INFO', 'Database connected']],
+    * ])
+    *
+    * // Execute later without resending SQL
+    * await db.executePipelineTransaction('log-events')
+    * ```
+    */
+   async registerPipeline(
+      pipelineId: string,
+      statements: Array<[string, SqlValue[]?]>
+   ): Promise<void> {
+      await invoke<void>('plugin:sqlite|register_pipeline', {
+         pipelineId,
+         statements: statements.map(([query, values]) => ({
+            query,
+            values: values ?? [],
+         })),
+      })
+   }
+
+   /**
+    * **executePipelineTransaction**
+    *
+    * Execute a previously registered pipeline atomically.
+    *
+    * @param pipelineId - Identifier previously passed to `registerPipeline()`
+    * @returns Promise with per-statement write results
+    *
+    * @example
+    * ```ts
+    * // Register once
+    * await db.registerPipeline('log-session', [
+    *    ['INSERT INTO logs (level, message) VALUES ($1, $2)', ['INFO', 'Session started']],
+    *    ['UPDATE stats SET sessions = sessions + 1'],
+    * ])
+    *
+    * // Execute multiple times
+    * const results = await db.executePipelineTransaction('log-session')
+    * console.log(results[0].rowsAffected)
+    * ```
+    */
+   async executePipelineTransaction(pipelineId: string): Promise<WriteQueryResult[]> {
+      return await invoke<WriteQueryResult[]>('plugin:sqlite|execute_pipeline_transaction', {
+         db: this.path,
+         pipelineId,
+      })
+   }
+
+   /**
     * **execute**
     *
     * Executes a write query against the database (INSERT, UPDATE, DELETE, etc.).

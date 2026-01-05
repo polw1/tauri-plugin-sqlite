@@ -199,6 +199,39 @@ type SqlValue = string | number | boolean | null | Uint8Array
 | NULL        | `null`          | |
 | BLOB        | `Uint8Array`    | Binary data |
 
+### Cached command pipelines
+
+Register batches of statements under an identifier for later execution.
+Statements are stored on the backend and can be executed multiple times
+without resending the SQL and bindings.
+
+Benefits:
+
+* Reduces data transfer for repeated statement batches
+* Stores statements on the backend, executions only send the identifier
+* Returns `PIPELINE_NOT_FOUND` error for unknown identifiers
+
+Example usage:
+
+```ts
+import Database from '@silvermine/tauri-plugin-sqlite'
+
+const db = await Database.load('main.db')
+
+// Register once at startup
+await db.registerPipeline('log-startup', [
+   ['INSERT INTO logs (level, message) VALUES ($1, $2)', ['INFO', 'App started']],
+   ['INSERT INTO logs (level, message) VALUES ($1, $2)', ['INFO', 'Database ready']],
+])
+
+// Execute later without resending SQL
+const results = await db.executePipelineTransaction('log-startup')
+console.log(results[0].rowsAffected)
+```
+
+`registerPipeline()` stores statements on the backend.
+`executePipelineTransaction()` runs them atomically in a write transaction.
+
 > **Note:** JavaScript safely represents integers up to ±2^53 - 1. The plugin binds
 > integers as SQLite's INTEGER type (i64), maintaining full precision within that range.
 

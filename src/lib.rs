@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
+
 use serde::Serialize;
 use sqlx_sqlite_conn_mgr::Migrator;
 use tauri::{Emitter, Manager, RunEvent, Runtime, plugin::Builder as PluginBuilder};
@@ -13,6 +15,7 @@ mod error;
 mod transactions;
 mod wrapper;
 
+pub use crate::commands::DbCommandPipeline;
 pub use error::{Error, Result};
 pub use sqlx_sqlite_conn_mgr::Migrator as SqliteMigrator;
 pub use transactions::{ActiveInterruptibleTransactions, ActiveRegularTransactions};
@@ -23,7 +26,11 @@ pub use wrapper::{DatabaseWrapper, WriteQueryResult};
 /// This struct maintains a thread-safe map of database paths to their corresponding
 /// connection wrappers.
 #[derive(Clone, Default)]
-pub struct DbInstances(pub Arc<RwLock<HashMap<String, DatabaseWrapper>>>);
+pub struct DbInstances(pub Arc<DashMap<String, DatabaseWrapper>>);
+
+/// Registry of reusable command pipelines keyed by user-provided identifiers.
+#[derive(Clone, Default)]
+pub struct CommandRegistry(pub Arc<DashMap<String, DbCommandPipeline>>);
 
 /// Migration status for a database.
 #[derive(Debug, Clone)]
@@ -157,13 +164,15 @@ impl Builder {
       let migrations = Arc::new(self.migrations);
 
       PluginBuilder::<R>::new("sqlite")
-         .invoke_handler(tauri::generate_handler![
-            commands::load,
-            commands::execute,
-            commands::execute_transaction,
-            commands::execute_interruptible_transaction,
-            commands::transaction_continue,
-            commands::transaction_read,
+            .invoke_handler(tauri::generate_handler![
+               commands::load,
+               commands::execute,
+               commands::execute_transaction,
+               commands::register_pipeline,
+               commands::execute_pipeline_transaction,
+               commands::execute_interruptible_transaction,
+               commands::transaction_continue,
+               commands::transaction_read,
             commands::fetch_all,
             commands::fetch_one,
             commands::close,
@@ -173,6 +182,7 @@ impl Builder {
          ])
          .setup(move |app, _api| {
             app.manage(DbInstances::default());
+            app.manage(CommandRegistry::default());
             app.manage(MigrationStates::default());
             app.manage(ActiveInterruptibleTransactions::default());
             app.manage(ActiveRegularTransactions::default());
@@ -236,9 +246,9 @@ impl Builder {
                         transactions::cleanup_all_transactions(&interruptible_txs_clone, &regular_txs_clone).await;
 
                         // Then close databases
-                        let mut guard = instances_clone.0.write().await;
                         let wrappers: Vec<DatabaseWrapper> =
-                           guard.drain().map(|(_, v)| v).collect();
+                           instances_clone.0.iter().map(|entry| entry.value().clone()).collect();
+                        instances_clone.0.clear();
 
                         // Close databases in parallel with timeout
                         let mut set = tokio::task::JoinSet::new();
@@ -279,20 +289,13 @@ impl Builder {
                   // ExitRequested should have already closed all databases
                   // This is just a safety check
                   let instances = app.state::<DbInstances>();
-                  match instances.0.try_read() {
-                     Ok(guard) => {
-                        if !guard.is_empty() {
-                           warn!(
-                              "Exit event fired with {} database(s) still open - cleanup may have been skipped",
-                              guard.len()
-                           );
-                        } else {
-                           debug!("Exit event: all databases already closed");
-                        }
-                     }
-                     Err(_) => {
-                        warn!("Exit event: could not check database state (lock held - cleanup may still be in progress)");
-                     }
+                  if !instances.0.is_empty() {
+                     warn!(
+                        "Exit event fired with {} database(s) still open - cleanup may have been skipped",
+                        instances.0.len()
+                     );
+                  } else {
+                     debug!("Exit event: all databases already closed");
                   }
                }
                _ => {

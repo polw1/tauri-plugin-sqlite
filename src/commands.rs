@@ -3,6 +3,8 @@
 //! This module implements the Tauri command handlers that the frontend calls.
 //! Each command manages database connections through the DbInstances state.
 
+use std::sync::Arc;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -11,7 +13,8 @@ use tauri::{AppHandle, Runtime, State};
 use uuid::Uuid;
 
 use crate::{
-   DbInstances, Error, MigrationEvent, MigrationStates, MigrationStatus, Result, WriteQueryResult,
+   CommandRegistry, DbInstances, Error, MigrationEvent, MigrationStates,
+   MigrationStatus, Result, WriteQueryResult,
    transactions::{
       ActiveInterruptibleTransaction, ActiveInterruptibleTransactions, ActiveRegularTransactions,
       Statement,
@@ -25,6 +28,25 @@ use crate::{
 pub struct TransactionToken {
    pub db_path: String,
    pub transaction_id: String,
+}
+
+/// Pipeline of cached statements that can be executed by identifier.
+#[derive(Clone)]
+pub struct DbCommandPipeline(Arc<Vec<(String, Vec<JsonValue>)>>);
+
+impl DbCommandPipeline {
+   pub fn new(statements: Vec<Statement>) -> Self {
+      let tuples = statements
+         .into_iter()
+         .map(|s| (s.query, s.values))
+         .collect();
+
+      Self(Arc::new(tuples))
+   }
+
+   pub fn statements(&self) -> Vec<(String, Vec<JsonValue>)> {
+      self.0.as_ref().clone()
+   }
 }
 
 /// Actions that can be taken on an interruptible transaction
@@ -59,27 +81,14 @@ pub async fn load<R: Runtime>(
    // Wait for migrations to complete if registered for this database
    await_migrations(&migration_states, &db).await?;
 
-   let instances = db_instances.0.read().await;
-
-   // Return cached if db was already loaded
-   if instances.contains_key(&db) {
+   // Check if database is already loaded using DashMap for lock-free read access
+   if db_instances.0.contains_key(&db) {
       return Ok(db);
    }
 
-   drop(instances); // Release read lock before acquiring write lock
-
-   let mut instances = db_instances.0.write().await;
-
-   // Use entry API to atomically check and insert, avoiding race conditions
-   // where two callers could both create wrappers
-   use std::collections::hash_map::Entry;
-   match instances.entry(db.clone()) {
-      Entry::Occupied(_) => {
-         // Another caller won the race and inserted while we waited for write lock
-         Ok(db)
-      }
-      Entry::Vacant(entry) => {
-         // We won the race, create and insert the wrapper
+   match db_instances.0.entry(db.clone()) {
+      dashmap::mapref::entry::Entry::Occupied(_) => Ok(db),
+      dashmap::mapref::entry::Entry::Vacant(entry) => {
          let wrapper = DatabaseWrapper::connect(&db, &app, custom_config).await?;
          entry.insert(wrapper);
          Ok(db)
@@ -95,33 +104,39 @@ pub async fn load<R: Runtime>(
 ///
 /// Returns Err if migrations failed.
 async fn await_migrations(migration_states: &State<'_, MigrationStates>, db: &str) -> Result<()> {
+   // Acquire Notify handle once.
+   let notify = loop {
+      let states = migration_states.0.read().await;
+      match states.get(db) {
+         None => return Ok(()),
+         Some(state) => match &state.status {
+            MigrationStatus::Complete => return Ok(()),
+            MigrationStatus::Failed(error) => {
+               return Err(Error::Migration(sqlx::migrate::MigrateError::Source(
+                  error.clone().into(),
+               )));
+            }
+            MigrationStatus::Pending | MigrationStatus::Running => break state.notify.clone(),
+         },
+      }
+   };
+
    loop {
-      // Get notify handle before checking status
-      let notify = {
-         let states = migration_states.0.read().await;
-         match states.get(db) {
-            // No migrations registered for this database
-            None => return Ok(()),
-
-            Some(state) => match &state.status {
-               // Migrations completed successfully
-               MigrationStatus::Complete => return Ok(()),
-
-               // Migrations failed - return the error
-               MigrationStatus::Failed(error) => {
-                  return Err(Error::Migration(sqlx::migrate::MigrateError::Source(
-                     error.clone().into(),
-                  )));
-               }
-
-               // Migrations still pending or running - wait for notification
-               MigrationStatus::Pending | MigrationStatus::Running => state.notify.clone(),
-            },
-         }
-      };
-
-      // Wait for migration state change
       notify.notified().await;
+
+      let states = migration_states.0.read().await;
+      match states.get(db) {
+         None => return Ok(()),
+         Some(state) => match &state.status {
+            MigrationStatus::Complete => return Ok(()),
+            MigrationStatus::Failed(error) => {
+               return Err(Error::Migration(sqlx::migrate::MigrateError::Source(
+                  error.clone().into(),
+               )));
+            }
+            MigrationStatus::Pending | MigrationStatus::Running => continue,
+         },
+      }
    }
 }
 
@@ -133,10 +148,10 @@ pub async fn execute(
    query: String,
    values: Vec<JsonValue>,
 ) -> Result<(u64, i64)> {
-   let instances = db_instances.0.read().await;
-
-   let wrapper = instances
+   let wrapper = db_instances
+      .0
       .get(&db)
+      .map(|entry| entry.value().clone())
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
    let result = wrapper.execute(query, values).await?;
@@ -152,10 +167,10 @@ pub async fn execute_transaction(
    db: String,
    statements: Vec<Statement>,
 ) -> Result<Vec<WriteQueryResult>> {
-   let instances = db_instances.0.read().await;
-
-   let wrapper = instances
+   let wrapper = db_instances
+      .0
       .get(&db)
+      .map(|entry| entry.value().clone())
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
    // Convert Statement structs to tuples for wrapper
@@ -202,6 +217,79 @@ pub async fn execute_transaction(
    }
 }
 
+/// Register a pipeline of statements under an identifier.
+///
+/// Stores statements on the backend so they can be executed later
+/// without resending the full SQL and bindings.
+#[tauri::command]
+pub async fn register_pipeline(
+   registry: State<'_, CommandRegistry>,
+   pipeline_id: String,
+   statements: Vec<Statement>,
+) -> Result<()> {
+   registry
+      .0
+      .insert(pipeline_id, DbCommandPipeline::new(statements));
+   Ok(())
+}
+
+/// Execute a previously registered pipeline inside a transaction.
+///
+/// Runs cached statements atomically without resending SQL and bindings.
+#[tauri::command]
+pub async fn execute_pipeline_transaction(
+   db_instances: State<'_, DbInstances>,
+   registry: State<'_, CommandRegistry>,
+   regular_txs: State<'_, ActiveRegularTransactions>,
+   db: String,
+   pipeline_id: String,
+) -> Result<Vec<WriteQueryResult>> {
+   let pipeline = registry
+      .0
+      .get(&pipeline_id)
+      .map(|entry| entry.value().clone())
+      .ok_or_else(|| Error::PipelineNotFound(pipeline_id.clone()))?;
+
+   let wrapper = db_instances
+      .0
+      .get(&db)
+      .map(|entry| entry.value().clone())
+      .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
+
+   // Dispatch using the cached statements; cloning is shallow via Arc.
+   let stmt_tuples = pipeline.statements();
+
+   // Generate unique key for tracking this transaction
+   let tx_key = format!("{}:{}", db, Uuid::new_v4());
+
+   let wrapper_clone = wrapper.clone();
+   let tx_key_clone = tx_key.clone();
+   let regular_txs_clone = regular_txs.inner().clone();
+
+   let handle = tokio::spawn(async move {
+      let result = wrapper_clone.execute_transaction(stmt_tuples).await;
+      regular_txs_clone.remove(&tx_key_clone).await;
+      result
+   });
+
+   regular_txs
+      .insert(tx_key.clone(), handle.abort_handle())
+      .await;
+
+   match handle.await {
+      Ok(result) => result,
+      Err(e) => {
+         regular_txs.remove(&tx_key).await;
+
+         if e.is_cancelled() {
+            Err(Error::Other("Transaction aborted due to app exit".into()))
+         } else {
+            Err(Error::Other(format!("Transaction task panicked: {}", e)))
+         }
+      }
+   }
+}
+
 /// Execute a SELECT query returning all matching rows
 #[tauri::command]
 pub async fn fetch_all(
@@ -210,10 +298,10 @@ pub async fn fetch_all(
    query: String,
    values: Vec<JsonValue>,
 ) -> Result<Vec<IndexMap<String, JsonValue>>> {
-   let instances = db_instances.0.read().await;
-
-   let wrapper = instances
+   let wrapper = db_instances
+      .0
       .get(&db)
+      .map(|entry| entry.value().clone())
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
    let rows = wrapper.fetch_all(query, values).await?;
@@ -229,10 +317,10 @@ pub async fn fetch_one(
    query: String,
    values: Vec<JsonValue>,
 ) -> Result<Option<IndexMap<String, JsonValue>>> {
-   let instances = db_instances.0.read().await;
-
-   let wrapper = instances
+   let wrapper = db_instances
+      .0
       .get(&db)
+      .map(|entry| entry.value().clone())
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
    let row = wrapper.fetch_one(query, values).await?;
@@ -246,9 +334,7 @@ pub async fn fetch_one(
 /// Returns `false` if the database was not loaded (nothing to close).
 #[tauri::command]
 pub async fn close(db_instances: State<'_, DbInstances>, db: String) -> Result<bool> {
-   let mut instances = db_instances.0.write().await;
-
-   if let Some(wrapper) = instances.remove(&db) {
+   if let Some((_, wrapper)) = db_instances.0.remove(&db) {
       wrapper.close().await?;
       Ok(true)
    } else {
@@ -259,10 +345,13 @@ pub async fn close(db_instances: State<'_, DbInstances>, db: String) -> Result<b
 /// Close all database connections
 #[tauri::command]
 pub async fn close_all(db_instances: State<'_, DbInstances>) -> Result<()> {
-   let mut instances = db_instances.0.write().await;
-
    // Collect all wrappers to close
-   let wrappers: Vec<DatabaseWrapper> = instances.drain().map(|(_, v)| v).collect();
+   let wrappers: Vec<DatabaseWrapper> = db_instances
+      .0
+      .iter()
+      .map(|entry| entry.value().clone())
+      .collect();
+   db_instances.0.clear();
 
    // Close each connection, continuing on errors to ensure all get closed
    let mut last_error = None;
@@ -284,9 +373,7 @@ pub async fn close_all(db_instances: State<'_, DbInstances>) -> Result<()> {
 /// Returns `false` if the database was not loaded (nothing to remove).
 #[tauri::command]
 pub async fn remove(db_instances: State<'_, DbInstances>, db: String) -> Result<bool> {
-   let mut instances = db_instances.0.write().await;
-
-   if let Some(wrapper) = instances.remove(&db) {
+   if let Some((_, wrapper)) = db_instances.0.remove(&db) {
       wrapper.remove().await?;
       Ok(true)
    } else {
@@ -325,10 +412,10 @@ pub async fn execute_interruptible_transaction(
    db: String,
    initial_statements: Vec<Statement>,
 ) -> Result<TransactionToken> {
-   let instances = db_instances.0.read().await;
-
-   let wrapper = instances
+   let wrapper = db_instances
+      .0
       .get(&db)
+      .map(|entry| entry.value().clone())
       .ok_or_else(|| Error::DatabaseNotLoaded(db.clone()))?;
 
    // Generate unique transaction ID
