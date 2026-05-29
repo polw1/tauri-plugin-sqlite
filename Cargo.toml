@@ -13,7 +13,7 @@ version = "0.2.0"
 description = "A Tauri plugin for SQLite with connection pooling, builder-pattern queries, transactions, and reactive change notifications"
 license = "MIT"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94.0"
 links = "tauri-plugin-sqlite"
 
 [dependencies]

@@ -69,7 +69,7 @@ See individual crate READMEs for detailed API documentation.
 
 ## Installation
 
-_Requires Rust **1.77.2** or later_
+_Requires Rust **1.94.0** or later_
 
 ### Rust
 
